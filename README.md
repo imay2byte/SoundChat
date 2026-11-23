@@ -62,7 +62,7 @@ src/app/
 Requisitos: Node.js 18 o superior.
 
 ```bash
-git clone https://github.com/TU_USUARIO/soundchat.git
+git clone https://github.com/imay2byte/soundchat.git
 cd soundchat
 npm install
 npm run dev
