@@ -1,69 +1,240 @@
-import Image from "next/image";
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Header from "./components/headers";
+import Hero from "./components/hero";
+import SignalChannel from "./components/signalchannel";
+import Transmitter from "./components/transmitter";
+import Receiver from "./components/receiver";
+import BitStrip from "./components/bitstrip";
+import FskExplainer from "./components/fskexplainer";
+import Footer from "./components/footer";
+import {
+  BIT_MS,
+  F0,
+  F1,
+  HEADER_BITS,
+  FskDecoder,
+  buildFrame,
+  bytesToBits,
+} from "./lib/fsk";
+
+const getAudioContext = () => window.AudioContext || window.webkitAudioContext;
 
 export default function Home() {
+  const [transmitting, setTransmitting] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [decoding, setDecoding] = useState(false);
+  const [receivedMessage, setReceivedMessage] = useState("");
+  const [error, setError] = useState("");
+  const [analyser, setAnalyser] = useState(null);
+  const [bits, setBits] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const rx = useRef(null);
+
+  /* ---------- EMISOR ---------- */
+  const handleTransmit = useCallback(async (text) => {
+    const Ctx = getAudioContext();
+    if (!Ctx) {
+      setError("Tu navegador no admite la Web Audio API.");
+      return;
+    }
+
+    const frame = buildFrame(text);
+    const ctx = new Ctx();
+    await ctx.resume();
+
+    const seconds = BIT_MS / 1000;
+    const t0 = ctx.currentTime + 0.2;
+    const tEnd = t0 + frame.bits.length * seconds;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const tap = ctx.createAnalyser();
+    tap.fftSize = 2048;
+    osc.type = "sine";
+
+    // Un salto de frecuencia por bit, sin cortes de fase.
+    [...frame.bits].forEach((bit, i) => {
+      osc.frequency.setValueAtTime(bit === "1" ? F1 : F0, t0 + i * seconds);
+    });
+
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.6, t0 + 0.02);
+    gain.gain.setValueAtTime(0.6, tEnd);
+    gain.gain.linearRampToValueAtTime(0, tEnd + 0.03);
+
+    osc.connect(gain);
+    gain.connect(tap);
+    tap.connect(ctx.destination);
+
+    setError("");
+    setBits(frame.payloadBits);
+    setActiveIndex(-1);
+    setAnalyser(tap);
+    setTransmitting(true);
+
+    let raf;
+    const tick = () => {
+      const index = Math.floor((ctx.currentTime - t0) / seconds) - HEADER_BITS;
+      setActiveIndex(index >= 0 && index < frame.payloadBits.length ? index : -1);
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+
+    osc.onended = () => {
+      cancelAnimationFrame(raf);
+      setActiveIndex(-1);
+      setTransmitting(false);
+      setAnalyser(rx.current?.analyser ?? null);
+      ctx.close();
+    };
+
+    osc.start(t0);
+    osc.stop(tEnd + 0.05);
+  }, []);
+
+  /* ---------- RECEPTOR ---------- */
+  const stopListening = useCallback(() => {
+    const r = rx.current;
+    if (!r) return;
+    rx.current = null;
+
+    r.proc.onaudioprocess = null;
+    r.proc.disconnect();
+    r.source.disconnect();
+    r.stream.getTracks().forEach((track) => track.stop());
+    r.ctx.close();
+
+    setListening(false);
+    setDecoding(false);
+    setAnalyser((current) => (current === r.analyser ? null : current));
+  }, []);
+
+  const startListening = useCallback(async () => {
+    setError("");
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("El micrófono solo funciona en localhost o con HTTPS.");
+      return;
+    }
+
+    try {
+      // Sin procesado: la cancelación de ruido borraría los tonos.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+
+      const Ctx = getAudioContext();
+      const ctx = new Ctx();
+      await ctx.resume();
+
+      const source = ctx.createMediaStreamSource(stream);
+      const tap = ctx.createAnalyser();
+      tap.fftSize = 2048;
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
+
+      const decoder = new FskDecoder(ctx.sampleRate, {
+        onSync: () => {
+          setDecoding(true);
+          setReceivedMessage("");
+          setError("");
+          setBits("");
+        },
+        onByte: (bytes) => {
+          const data = Uint8Array.from(bytes);
+          setReceivedMessage(new TextDecoder().decode(data, { stream: true }));
+          const decoded = bytesToBits(data);
+          setBits(decoded);
+          setActiveIndex(decoded.length - 1);
+        },
+        onMessage: (bytes) => {
+          setReceivedMessage(new TextDecoder().decode(Uint8Array.from(bytes)));
+          setDecoding(false);
+          setActiveIndex(-1);
+        },
+        onError: (message) => {
+          setError(message);
+          setReceivedMessage("");
+          setDecoding(false);
+          setActiveIndex(-1);
+        },
+      });
+
+      proc.onaudioprocess = (event) => {
+        decoder.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+      };
+
+      source.connect(tap);
+      source.connect(proc);
+      proc.connect(mute);
+      mute.connect(ctx.destination);
+
+      rx.current = { ctx, stream, source, proc, analyser: tap };
+      setAnalyser(tap);
+      setListening(true);
+    } catch (err) {
+      setError(
+        err?.name === "NotAllowedError"
+          ? "Sin permiso para usar el micrófono. Actívalo en el navegador y vuelve a intentarlo."
+          : "No se pudo abrir el micrófono. Revisa que haya uno conectado."
+      );
+    }
+  }, []);
+
+  const toggleReceiver = () => (listening ? stopListening() : startListening());
+
+  useEffect(() => stopListening, [stopListening]);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.js
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="soundchat">
+      <Header />
+
+      <Hero />
+
+      <section className="channel-section">
+        <div className="channel-heading">
+          <span>03 — EL CANAL DE AIRE</span>
+          <span>EMISIÓN / RECEPCIÓN</span>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        <div className="channel-layout">
+          <Transmitter onTransmit={handleTransmit} transmitting={transmitting} />
+
+          <SignalChannel
+            analyser={analyser}
+            listening={listening}
+            transmitting={transmitting}
+          />
+
+          <Receiver
+            onToggle={toggleReceiver}
+            listening={listening}
+            receivedMessage={receivedMessage}
+            error={error}
+            decoding={decoding}
+          />
         </div>
-      </main>
-    </div>
+
+        <div className="bits-section">
+          <div>
+            <span className="bits-title">Trama binaria</span>
+            <span className="bits-subtitle">REPRESENTACIÓN DE LOS DATOS</span>
+          </div>
+
+          <BitStrip bits={bits} activeIndex={activeIndex} />
+        </div>
+      </section>
+
+      <FskExplainer />
+
+      <Footer />
+    </main>
   );
 }
